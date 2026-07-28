@@ -57,9 +57,23 @@ tries the live call and falls back to the profile automatically.
 
 ```sh
 logi profiles          # DPI stages, report rate, per-button bindings
+logi profile use 1     # activate a profile
 logi onboard           # onboard (device-managed) vs host (software-managed)
 logi dump-sector 1     # raw hex, for when a new profile format shows up
 ```
+
+**If button bindings seem to do nothing, check `logi onboard` first.** In *host*
+mode the firmware ignores its onboard profiles entirely and waits for software
+to drive it, so a perfectly-written binding is simply never read. DPI hides this
+symptom, because that goes to the sensor directly and keeps working. Re-pairing
+a mouse can flip it into host mode on its own.
+
+The mode values are `0 = no change`, `1 = onboard`, `2 = host` — note that 0 is
+*not* "onboard", so writing 0 is a silent no-op that reads back as success.
+`logi onboard` re-reads the mode after setting it rather than trusting the write.
+
+`setActiveProfile` is rejected while in host mode; switching to onboard mode
+selects a profile again on its own.
 
 A profile sector is a fixed-layout blob ending in a CRC-16/CCITT. `logi` reads
 the sector, patches only the bytes it means to change, recomputes the CRC, and
@@ -81,6 +95,22 @@ logi unpair 1 --yes
 
 A Lightspeed receiver only accepts the mouse model it shipped with — mismatched
 pairs are silently ignored by the receiver, not rejected with an error.
+
+**A Lightspeed receiver holds exactly one device, and the slot must be free.**
+If a pairing is already stored, opening the lock succeeds and the receiver
+genuinely listens — it just has nowhere to put a new device, so the attempt
+times out looking exactly like an incompatible mouse. Clear it first:
+
+```sh
+logi info -d 1        # "Devices linked: 1" means the slot is taken
+logi unpair 1 --yes
+logi pair --timeout 120
+```
+
+`logi pair` sends slot 0 ("receiver picks"), which is what the official tools
+do, and sets the receiver's wireless notification flag (register 0x00) first —
+without it the receiver never announces that a device joined, and a successful
+pairing looks like a timeout.
 
 PRO X / Superlight mice have **no pairing button**. They advertise only on
 power-up while unpaired, so `logi pair` works by opening the receiver's lock and
