@@ -11,6 +11,7 @@ receiver** (046d:c547).
 
 ```sh
 make
+make test             # tests use a fake mouse
 sudo make install     # /usr/local/bin/logi
 ```
 
@@ -56,11 +57,60 @@ tries the live call and falls back to the profile automatically.
 ## Onboard profiles
 
 ```sh
-logi profiles          # DPI stages, report rate, per-button bindings
-logi profile use 1     # activate a profile
-logi onboard           # onboard (device-managed) vs host (software-managed)
-logi dump-sector 1     # raw hex, for when a new profile format shows up
+logi profiles                     # DPI stages, report rate, button bindings
+logi profile use 1                # activate the first listed profile
+logi profile use 0x0001           # select a sector directly
+logi profile create               # copy the selected profile into a free slot
+logi profile factory              # back up the user directory and return to defaults
+logi profile backup               # save all profile memory to a file
+logi profile restore backup.json  # restore a saved backup
+logi onboard                      # onboard vs host mode
+logi dump-sector 1                # raw hex, for when a new profile format shows up
 ```
+
+A mouse can report room for five profiles while listing only one. The PRO X 2
+DEX can be running its read-only factory profile at `0x0101` with an empty user
+profile directory. `dpi set --persist`, `rate set --persist`, and `buttons set`
+copy that factory profile into a free user slot on the first edit. Later edits
+write back to the user profile. `profile create` makes a separate copy instead.
+Use `--profile 0x0101` to copy from the factory profile explicitly.
+
+Add `--dry-run` to an onboard edit or to `profile create`, `profile restore`,
+or `profile factory` to see what it would do without changing the mouse.
+Writes need onboard mode and at least 20% battery if the mouse reports a level.
+Profile formats above 7 aren't supported for writing yet.
+
+Each onboard edit starts with a backup in `~/Library/Application Support/logi/backups/`.
+The command prints the path and stops if it can't save the file. Backups contain
+all user sectors, the factory directory and profiles, and the current selection.
+Restore checks the file's checksum, the mouse's identity and memory layout, and
+requires a backup taken in onboard mode. It saves a fresh backup before writing.
+
+**To get back to factory settings, run `logi profile factory`.** The defaults
+come from the mouse's ROM, so this doesn't need an older backup file. DEX
+firmware refuses to select ROM while a user directory exists. The command
+backs up that directory, replaces it with an empty one, then selects the factory
+profile. User profile data stays in memory, but disappears from `logi profiles`.
+Use the printed backup with `logi profile restore` to get those entries back.
+`profile use 1` won't restore them. `profile use factory` and
+`profile use 0x0101` do the same thing as `profile factory`.
+
+Edits temporarily clear the user directory so the mouse can run its factory
+profile while user data is being written. The directory goes back last, after
+the profile has been read back and checked. This costs two extra directory
+writes per edit. Setting an already-stored value skips the write altogether.
+Restore also writes the directory last and leaves unused sector data alone.
+
+MPM 37.03 has another quirk. Committing an empty directory returns
+`INVALID_ARGUMENT` even though it saves the bytes and selects ROM. `logi`
+accepts that reply only for an empty directory whose bytes read back exactly,
+with the mouse in onboard mode and a factory profile active.
+
+A lost connection can leave a write unfinished. `logi` tries to select the
+factory profile and reports whether that worked, but doesn't retry the write.
+Once the mouse reconnects, use `profile factory` or restore the backup. Profile
+commands don't write firmware. The low-level `raw` command bypasses the backup
+and validation checks.
 
 **If button bindings seem to do nothing, check `logi onboard` first.** In *host*
 mode the firmware ignores its onboard profiles entirely and waits for software
@@ -75,14 +125,17 @@ The mode values are `0 = no change`, `1 = onboard`, `2 = host` — note that 0 i
 `setActiveProfile` is rejected while in host mode; switching to onboard mode
 selects a profile again on its own.
 
-A profile sector is a fixed-layout blob ending in a CRC-16/CCITT. `logi` reads
-the sector, patches only the bytes it means to change, recomputes the CRC, and
-writes it back — so an edit never disturbs lighting, macros, or timeouts.
+A user profile sector is a fixed-layout blob ending in a CRC-16/CCITT. `logi`
+checks the CRC, patches only the bytes it means to change, recomputes the CRC,
+and checks the whole sector after writing it back. Factory sectors can omit
+the checksum, so a new writable copy gets one.
 
 Logitech has revised that layout. Format ≤5 (what Solaar decodes) packs five
 16-bit DPI values at offset 3. Format 6+ stores five-byte X/Y/lift-off records
-at offset 4 and shifts the button banks from 32/96 to 48/112. `logi` picks the
-layout from the `profileFormat` byte the device reports.
+at offset 4 and shifts the button banks from 32/96 to 48/112. Bytes 0/1 hold
+wireless/wired report rates and bytes 2/3 hold default/shift DPI indices. `logi`
+picks the layout from the `profileFormat` byte the device reports. The `*` in
+`profiles` marks the stored default DPI stage. Use `logi dpi` for the live value.
 
 ## Pairing
 
@@ -157,3 +210,6 @@ onboard-profile layout come from [Solaar](https://github.com/pwr-Solaar/Solaar)
 (GPLv2) and [libratbag](https://github.com/libratbag/libratbag). The format-6+
 profile layout and the 0x8061 connection-type quirk were reverse-engineered
 here against a PRO X 2 DEX.
+
+The format-7 DPI offsets were checked against [OpenMouse's protocol notes](https://github.com/OpenMouse-Project/mouse-protocol/blob/main/docs/logitech-onboard-profiles.md)
+and a PRO X 2 DEX factory profile, saved in `Tests/Fixtures/`.
