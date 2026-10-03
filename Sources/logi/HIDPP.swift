@@ -47,6 +47,7 @@ final class HIDPPDevice {
     let iface: any HIDPPTransport
     let index: UInt8
     var timeout: TimeInterval = 1.0
+    var profileBackupDirectory: URL?
 
     private var featureIndexCache: [UInt16: (index: UInt8, version: UInt8)] = [:]
 

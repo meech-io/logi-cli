@@ -376,12 +376,12 @@ extension HIDPPDevice {
 
 // MARK: - Onboard profiles (0x8100) — where persistent DPI and button bindings live
 
-struct OnboardProfileHeader {
+struct OnboardProfileHeader: Equatable {
     var sector: UInt16
     var enabled: UInt8
 }
 
-struct OnboardDescriptor {
+struct OnboardDescriptor: Codable, Equatable {
     var memoryModel: UInt8
     var profileFormat: UInt8
     var macroFormat: UInt8
@@ -409,6 +409,9 @@ struct ProfileLayout {
     /// Byte 0 holds a report-rate index in the new format, milliseconds in the old.
     var rateIsIndex: Bool
 
+    var defaultIndexOffset: Int { hasPerAxisDPI ? 2 : 1 }
+    var shiftIndexOffset: Int { hasPerAxisDPI ? 3 : 2 }
+
     static func forFormat(_ format: UInt8) -> ProfileLayout {
         if format >= 6 {
             return ProfileLayout(resolutionsOffset: 4, resolutionStride: 5, resolutionSlots: 5,
@@ -429,8 +432,8 @@ struct OnboardProfile {
     var buttonCount: Int
     var layout: ProfileLayout
 
-    var defaultResolutionIndex: Int { Int(raw[1]) }
-    var shiftResolutionIndex: Int { Int(raw[2]) }
+    var defaultResolutionIndex: Int { Int(raw[layout.defaultIndexOffset]) }
+    var shiftResolutionIndex: Int { Int(raw[layout.shiftIndexOffset]) }
 
     var reportRateHz: Int? {
         if layout.rateIsIndex {
@@ -539,6 +542,9 @@ extension HIDPPDevice {
 
     /// Read `size` bytes out of an onboard memory sector, 16 bytes at a time.
     func readSector(_ sector: UInt16, size: Int) throws -> [UInt8] {
+        guard size >= 16 && size <= 65535 else {
+            throw LogiError.usage("sector read size must be 16-65535 bytes")
+        }
         let f = try featureIndex(Feature.onboardProfiles)
         var bytes: [UInt8] = []
         var offset = 0
@@ -558,21 +564,43 @@ extension HIDPPDevice {
         return Array(bytes.prefix(size))
     }
 
-    /// Write a whole sector: begin, stream 16-byte chunks, commit. The caller is
-    /// responsible for the trailing CRC (see `sealSector`).
+    /// Write a whole user sector and check it by reading it back. The caller
+    /// saves a backup first; this checks the address, size and CRC.
     func writeSector(_ sector: UInt16, bytes: [UInt8]) throws {
+        let desc = try onboardDescriptor()
+        try desc.validateForWriting()
+        guard sector < 0x0100 && Int(sector) < desc.sectorCount,
+              bytes.count == desc.sectorSize, validSectorCRC(bytes) else {
+            throw LogiError.usage("refusing invalid or read-only sector write to 0x\(hex16(sector))")
+        }
+        if try readSector(sector, size: bytes.count) == bytes { return }
         let f = try featureIndex(Feature.onboardProfiles)
         let len = bytes.count
         _ = try call(featureIndex: f.index, function: 6,
                      params: [UInt8(sector >> 8), UInt8(sector & 0xFF), 0, 0,
                               UInt8(len >> 8), UInt8(len & 0xFF)])
-        var offset = 0
-        while offset < len {
-            let chunk = Array(bytes[offset..<min(offset + 16, len)])
-            _ = try call(featureIndex: f.index, function: 7, params: chunk)
-            offset += 16
+        for offset in stride(from: 0, to: len, by: 16) {
+            _ = try call(featureIndex: f.index, function: 7,
+                         params: Array(bytes[offset..<min(offset + 16, len)]))
         }
-        _ = try call(featureIndex: f.index, function: 8)
+        do {
+            _ = try call(featureIndex: f.index, function: 8)
+        } catch LogiError.featureError(let code, let feature, let function) {
+            // DEX MPM 37.03 saves an empty directory and selects ROM, then answers
+            // the commit with INVALID_ARGUMENT. Check the bytes and active profile
+            // before treating that particular reply as success.
+            guard sector == 0, code == 2, feature == f.index, function == 8,
+                  bytes.dropLast(2).allSatisfy({ $0 == 0xFF }),
+                  try readSector(0, size: len) == bytes,
+                  try onboardMode() == OnboardMode.onboard.rawValue,
+                  try factoryProfileHeaders().contains(where: { $0.sector == (try? activeProfile()) }) else {
+                throw LogiError.featureError(code: code, feature: feature, function: function)
+            }
+            FileHandle.standardError.write(Data("Firmware reported a commit error, but the empty directory and active factory profile read back correctly.\n".utf8))
+        }
+        guard try readSector(sector, size: len) == bytes else {
+            throw LogiError.protocolError("read-back verification failed for sector 0x\(hex16(sector))")
+        }
     }
 
     /// Recompute the trailing CRC-16 over a sector image.
@@ -584,27 +612,19 @@ extension HIDPPDevice {
         return out
     }
 
-    /// Walk the control sector (sector 0, or ROM sector 0x0100) for the list of
-    /// profile sectors.
+    /// User profiles, or factory profiles when no user directory exists.
     func profileHeaders() throws -> [OnboardProfileHeader] {
-        let f = try featureIndex(Feature.onboardProfiles)
-        var base: UInt8 = 0x00
-        var chunk = try call(featureIndex: f.index, function: 5, params: [0, 0, 0, 0])
-        if Array(chunk.prefix(4)) == [0, 0, 0, 0] || Array(chunk.prefix(4)) == [0xFF, 0xFF, 0xFF, 0xFF] {
-            base = 0x01  // fall back to the read-only factory copy
-            chunk = try call(featureIndex: f.index, function: 5, params: [0x01, 0, 0, 0])
-        }
-        var headers: [OnboardProfileHeader] = []
-        var i = 0
-        while chunk.count >= 3 && !(chunk[0] == 0xFF && chunk[1] == 0xFF) {
-            headers.append(OnboardProfileHeader(sector: UInt16(chunk[0]) << 8 | UInt16(chunk[1]), enabled: chunk[2]))
-            i += 1
-            if i >= 16 { break }
-            let offset = i * 4
-            chunk = try call(featureIndex: f.index, function: 5,
-                             params: [base, 0, UInt8(offset >> 8), UInt8(offset & 0xFF)])
-        }
-        return headers
+        let desc = try onboardDescriptor()
+        let raw = try readSector(0, size: desc.sectorSize)
+        let user = try decodeProfileDirectory(raw, descriptor: desc)
+        return user.isEmpty ? try factoryProfileHeaders() : user
+    }
+
+    /// Read ROM independently so recovery still works with a bad user directory.
+    func factoryProfileHeaders() throws -> [OnboardProfileHeader] {
+        let desc = try onboardDescriptor()
+        let raw = try readSector(0x0100, size: desc.sectorSize)
+        return try decodeProfileDirectory(raw, descriptor: desc, factory: true)
     }
 
     func profiles() throws -> [OnboardProfile] {
@@ -621,60 +641,54 @@ extension HIDPPDevice {
         }
     }
 
-    /// Persist a DPI value by rewriting a resolution slot of a profile sector,
-    /// so the setting survives a power cycle. Returns the slot that was made
-    /// active.
-    @discardableResult
-    func writeOnboardDPI(_ value: Int, profileSector: UInt16, slot requestedSlot: Int?) throws -> Int {
-        let desc = try onboardDescriptor()
-        let layout = ProfileLayout.forFormat(desc.profileFormat)
-        var raw = try readSector(profileSector, size: desc.sectorSize)
-
-        let slot = requestedSlot ?? Int(raw[1])
-        guard slot >= 0 && slot < layout.resolutionSlots else {
-            throw LogiError.usage("DPI slot must be 0-\(layout.resolutionSlots - 1)")
-        }
-        let offset = layout.resolutionsOffset + slot * layout.resolutionStride
-        raw[offset] = UInt8(value & 0xFF)
-        raw[offset + 1] = UInt8((value >> 8) & 0xFF)
-        if layout.hasPerAxisDPI {
-            raw[offset + 2] = UInt8(value & 0xFF)          // Y resolution
-            raw[offset + 3] = UInt8((value >> 8) & 0xFF)
-            if raw[offset + 4] == 0xFF { raw[offset + 4] = 0x02 }  // lift-off distance
-        }
-        raw[1] = UInt8(slot)  // make the edited slot the active stage
-        try writeSector(profileSector, bytes: sealSector(raw))
-        return slot
-    }
-
-    /// Rewrite one button binding in a profile sector.
-    func writeOnboardButton(_ binding: [UInt8], index: Int, profileSector: UInt16, gShift: Bool) throws {
-        precondition(binding.count == 4)
-        let desc = try onboardDescriptor()
-        let layout = ProfileLayout.forFormat(desc.profileFormat)
-        guard index >= 0 && index < desc.buttonCount else {
-            throw LogiError.usage("button index must be 1-\(desc.buttonCount)")
-        }
-        var raw = try readSector(profileSector, size: desc.sectorSize)
-        let offset = (gShift ? layout.gButtonsOffset : layout.buttonsOffset) + index * 4
-        for (i, b) in binding.enumerated() { raw[offset + i] = b }
-        try writeSector(profileSector, bytes: sealSector(raw))
-    }
-
-    /// Rewrite the report rate stored in a profile sector.
-    func writeOnboardReportRate(hz: Int, profileSector: UInt16) throws {
-        let desc = try onboardDescriptor()
-        let layout = ProfileLayout.forFormat(desc.profileFormat)
-        var raw = try readSector(profileSector, size: desc.sectorSize)
-        if layout.rateIsIndex {
-            guard let idx = HIDPPDevice.extendedRates.firstIndex(of: hz) else {
-                throw LogiError.usage("unsupported report rate \(hz) Hz")
+    func writeOnboardDPI(_ value: Int, profileSector: UInt16, slot requestedSlot: Int?,
+                         dryRun: Bool = false) throws -> ProfileWriteResult {
+        guard value > 0 && value <= 60000 else { throw LogiError.usage("invalid DPI") }
+        return try editProfile(profileSector, dryRun: dryRun) { raw, desc in
+            let layout = ProfileLayout.forFormat(desc.profileFormat)
+            let slot = requestedSlot ?? Int(raw[layout.defaultIndexOffset])
+            guard (0..<layout.resolutionSlots).contains(slot) else {
+                throw LogiError.usage("DPI slot must be 0-\(layout.resolutionSlots - 1)")
             }
-            raw[0] = UInt8(idx)
-        } else {
-            guard hz > 0, 1000 % hz == 0 else { throw LogiError.usage("unsupported report rate \(hz) Hz") }
-            raw[0] = UInt8(1000 / hz)
+            let offset = layout.resolutionsOffset + slot * layout.resolutionStride
+            raw[offset] = UInt8(value & 0xFF)
+            raw[offset + 1] = UInt8(value >> 8)
+            if layout.hasPerAxisDPI {
+                raw[offset + 2] = UInt8(value & 0xFF)
+                raw[offset + 3] = UInt8(value >> 8)
+                if raw[offset + 4] == 0 || raw[offset + 4] == 0xFF { raw[offset + 4] = 2 }
+            }
+            raw[layout.defaultIndexOffset] = UInt8(slot)
         }
-        try writeSector(profileSector, bytes: sealSector(raw))
+    }
+
+    func writeOnboardButton(_ binding: [UInt8], index: Int, profileSector: UInt16,
+                            gShift: Bool, dryRun: Bool = false) throws -> ProfileWriteResult {
+        guard binding.count == 4 else { throw LogiError.usage("button binding must contain four bytes") }
+        return try editProfile(profileSector, dryRun: dryRun) { raw, desc in
+            let layout = ProfileLayout.forFormat(desc.profileFormat)
+            guard index >= 0 && index < min(desc.buttonCount, 16), !gShift || desc.hasGShift else {
+                throw LogiError.usage("invalid button index or unsupported G-shift bank")
+            }
+            let offset = (gShift ? layout.gButtonsOffset : layout.buttonsOffset) + index * 4
+            guard offset + 4 <= raw.count - 2 else { throw LogiError.unsupported("button lies outside profile") }
+            raw.replaceSubrange(offset..<offset + 4, with: binding)
+        }
+    }
+
+    func writeOnboardReportRate(hz: Int, profileSector: UInt16,
+                                dryRun: Bool = false) throws -> ProfileWriteResult {
+        return try editProfile(profileSector, dryRun: dryRun) { raw, desc in
+            let layout = ProfileLayout.forFormat(desc.profileFormat)
+            if layout.rateIsIndex {
+                guard let idx = HIDPPDevice.extendedRates.firstIndex(of: hz) else {
+                    throw LogiError.usage("unsupported report rate \(hz) Hz")
+                }
+                raw[self.index == HIDPP.wiredIndex ? 1 : 0] = UInt8(idx)
+            } else {
+                guard [125, 250, 500, 1000].contains(hz) else { throw LogiError.usage("unsupported report rate") }
+                raw[0] = UInt8(1000 / hz)
+            }
+        }
     }
 }
