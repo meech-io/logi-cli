@@ -31,7 +31,7 @@ let deviceKinds = ["unknown", "keyboard", "mouse", "numpad", "presenter",
 struct Receiver {
     let device: HIDPPDevice
 
-    var iface: HIDPPInterface { device.iface }
+    var iface: any HIDPPTransport { device.iface }
 
     /// Maximum pairing slots. Lightspeed receivers hold one device (a few hold two).
     var maxSlots: Int { 6 }

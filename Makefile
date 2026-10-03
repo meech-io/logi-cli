@@ -11,4 +11,9 @@ install: logi
 clean:
 	rm -f logi
 
-.PHONY: install clean
+test:
+	@mkdir -p .build
+	swiftc -o .build/profile-tests $(filter-out Sources/logi/main.swift,$(SOURCES)) Tests/main.swift -framework IOKit -framework CoreFoundation
+	./.build/profile-tests
+
+.PHONY: install clean test

@@ -44,13 +44,14 @@ enum HIDPP {
 /// interface), a device attached to a receiver (index 1...6), or a corded
 /// device (index 0xFF on its own interface).
 final class HIDPPDevice {
-    let iface: HIDPPInterface
+    let iface: any HIDPPTransport
     let index: UInt8
     var timeout: TimeInterval = 1.0
+    var profileBackupDirectory: URL?
 
     private var featureIndexCache: [UInt16: (index: UInt8, version: UInt8)] = [:]
 
-    init(iface: HIDPPInterface, index: UInt8) {
+    init(iface: any HIDPPTransport, index: UInt8) {
         self.iface = iface
         self.index = index
     }
@@ -93,8 +94,7 @@ final class HIDPPDevice {
 
         if reply[2] == 0xFF {
             let code = reply.count > 5 ? reply[5] : 0
-            throw LogiError.protocolError("device returned error: \(HIDPP.errorCodes20[code] ?? "code 0x\(hex(code))")"
-                + " (feature 0x\(hex(featureIndex)), function \(function))")
+            throw LogiError.featureError(code: code, feature: featureIndex, function: function)
         }
         if reply[2] == 0x8F {
             let code = reply.count > 5 ? reply[5] : 0

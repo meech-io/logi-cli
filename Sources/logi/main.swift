@@ -102,7 +102,7 @@ struct Args {
     func int(_ name: String) -> Int? { flags[name].flatMap(Int.init) }
 }
 
-let boolFlagNames: Set<String> = ["persist", "all", "help", "verbose", "yes"]
+let boolFlagNames: Set<String> = ["persist", "all", "help", "verbose", "yes", "dry-run"]
 
 func parseArgs(_ argv: [String]) -> Args {
     var positional: [String] = []
@@ -198,8 +198,13 @@ func selectReceiver(_ targets: [Target]) -> Receiver {
 /// sector 0 is the control sector, so writing there would corrupt the profile
 /// table. Fall back to the first real profile instead.
 func resolveProfileSector(_ d: HIDPPDevice) throws -> UInt16 {
-    if let explicitSector = args.flag("profile").flatMap({ UInt16($0, radix: 16) }) {
-        return explicitSector
+    if args.has("profile") {
+        guard let spec = args.flag("profile"),
+              let sector = UInt16(spec.replacingOccurrences(of: "0x", with: ""), radix: 16),
+              sector != 0, sector != 0x0100, sector != 0xFFFF else {
+            throw LogiError.usage("--profile requires a profile sector in hex, not a directory sector")
+        }
+        return sector
     }
     let active = try d.activeProfile()
     if active != 0x0000 && active != 0xFFFF { return active }
@@ -306,16 +311,17 @@ func cmdDPI() throws {
         throw LogiError.usage("\(value) DPI is not supported by this sensor. Supported: \(info.supportedDescription)")
     }
 
+    if args.has("dry-run") && !args.has("persist") {
+        throw LogiError.usage("--dry-run requires --persist for DPI changes")
+    }
+    if args.has("slot"), args.int("slot") == nil { throw LogiError.usage("--slot must be an integer") }
     if args.has("persist") {
         let sector = try resolveProfileSector(d)
-        let slot = try d.writeOnboardDPI(value, profileSector: sector, slot: args.int("slot"))
-        print("Wrote \(value) DPI into onboard profile sector 0x\(hex16(sector)), stage \(slot).")
-        // Some sensors also accept a live change; it just isn't the thing that persists.
-        try? d.setDPI(value)
-        if let now = try? d.dpi(), now.current == value {
-            print("Active DPI is now \(value).")
-        } else {
-            print("The stored value takes effect when the profile is (re)activated.")
+        let result = try d.writeOnboardDPI(value, profileSector: sector, slot: args.int("slot"), dryRun: args.has("dry-run"))
+        printProfileWrite(result, action: "\(value) DPI")
+        if !result.dryRun {
+            let now = try d.dpi()
+            print("Current DPI: \(now.current).")
         }
     } else {
         do {
@@ -342,18 +348,16 @@ func cmdRate() throws {
     let valueArg = first == "set" ? args.positional.dropFirst().first : first
     guard let valueArg, let hz = Int(valueArg) else { throw LogiError.usage("usage: logi rate set <hz> [--persist]") }
 
-    let live = try d.setReportRateLive(hz: hz)
-    if live && !args.has("persist") {
+    let supported = try d.reportRate().supported
+    guard supported.contains(hz) else { throw LogiError.usage("unsupported report rate \(hz) Hz") }
+    let live = args.has("persist") || args.has("dry-run") ? false : try d.setReportRateLive(hz: hz)
+    if live {
         print("Report rate set to \(hz) Hz.")
         return
     }
-    guard d.supports(Feature.onboardProfiles) else {
-        throw LogiError.unsupported("this device rejected the report-rate change and has no onboard profile to store it in")
-    }
     let sector = try resolveProfileSector(d)
-    try d.writeOnboardReportRate(hz: hz, profileSector: sector)
-    print("Report rate set to \(hz) Hz in onboard profile sector 0x\(hex16(sector))"
-        + (live ? " (and applied live)." : ".\n(The device refused a live change, so this takes effect from the profile.)"))
+    let result = try d.writeOnboardReportRate(hz: hz, profileSector: sector, dryRun: args.has("dry-run"))
+    printProfileWrite(result, action: "\(hz) Hz")
 }
 
 func cmdBattery() throws {
@@ -483,9 +487,9 @@ func onboardButtons(target t: Target, sub: String) throws {
             throw LogiError.usage("usage: logi buttons set <button-number> <action> [--gshift]")
         }
         let binding = try Binding.parse(args.positional[2])
-        try d.writeOnboardButton(binding, index: number - 1, profileSector: sector, gShift: gShift)
-        print("Button \(number)\(gShift ? " (G-shift)" : "") set to \(Binding.describe(binding)) "
-            + "in profile sector 0x\(hex16(sector)).")
+        let result = try d.writeOnboardButton(binding, index: number - 1, profileSector: sector,
+                                              gShift: gShift, dryRun: args.has("dry-run"))
+        printProfileWrite(result, action: "button \(number)\(gShift ? " (G-shift)" : "") → \(Binding.describe(binding))")
 
     case "remap", "divert", "groups", "reset":
         throw LogiError.unsupported("`buttons \(sub)` needs feature 0x1B04, which this device lacks. "
@@ -504,20 +508,31 @@ func cmdProfiles() throws {
     let mode = try d.onboardMode()
 
     print("\(t.label)\n")
-    print("  Mode:          \(mode == 0 ? "onboard" : "host")")
-    print("  Profiles:      \(desc.profileCount) (\(desc.buttonCount) buttons, G-shift: \(desc.hasGShift ? "yes" : "no"))")
+    print("  Mode:          \(HIDPPDevice.OnboardMode(rawValue: mode)?.label ?? "unknown")")
+    print("  Capacity:      \(desc.profileCount) user profiles (\(desc.buttonCount) buttons, G-shift: \(desc.hasGShift ? "yes" : "no"))")
     print("  Sectors:       \(desc.sectorCount) x \(desc.sectorSize) bytes")
     print("  Active sector: 0x\(hex16(active))\n")
 
-    for (i, p) in try d.profiles().enumerated() {
+    let factories = try d.factoryProfileHeaders()
+    var users: [OnboardProfileHeader] = []
+    do {
+        users = try decodeProfileDirectory(d.readSector(0, size: desc.sectorSize), descriptor: desc)
+    } catch {
+        print("  User directory: \(error)")
+    }
+    print("  Available:     \(users.count) user, \(factories.count) factory (read-only)\n")
+    for header in users + factories {
+        let p = OnboardProfile(sector: header.sector, raw: try d.readSector(header.sector, size: desc.sectorSize),
+                               buttonCount: desc.buttonCount, layout: ProfileLayout.forFormat(desc.profileFormat))
         let marker = p.sector == active ? "*" : " "
         let name = p.name.isEmpty ? "(unnamed)" : p.name
-        print("\(marker) Profile \(i + 1) — sector 0x\(hex16(p.sector)) — \(name)")
+        let kind = p.sector >= 0x0100 ? "Factory profile (read-only)" : "User profile"
+        print("\(marker) \(kind) — sector 0x\(hex16(p.sector)) — \(name)")
         let slots = p.resolutions.enumerated().map { i, dpi -> String in
             let marker = i == p.defaultResolutionIndex ? "*" : ""
             return dpi > 0 && dpi != 0xFFFF ? "\(marker)\(dpi)" : "\(marker)—"
         }
-        print("    DPI slots:   \(slots.joined(separator: ", "))   (* = active stage)")
+        print("    DPI slots:   \(slots.joined(separator: ", "))   (* = stored default stage)")
         print("    Report rate: \(p.reportRateHz.map { "\($0) Hz" } ?? "unset")")
         for b in 0..<min(p.buttonCount, 16) {
             let bytes = p.button(b)
@@ -551,27 +566,75 @@ func cmdDumpSector() throws {
     }
 }
 
+func printProfileWrite(_ result: ProfileWriteResult, action: String) {
+    let verb = result.dryRun ? "Would save" : (result.changed ? "Saved" : "Already stored")
+    print("\(verb) \(action) in profile sector 0x\(hex16(result.sector)).")
+    if result.created { print(result.dryRun ? "Would create a writable copy. Nothing was changed." : "Created and activated a writable profile.") }
+    if result.dryRun && !result.created { print("Nothing was changed.") }
+}
+
 /// Activate one of the onboard profiles, by 1-based number or by sector.
 func cmdProfileUse() throws {
     let d = selectTarget(discoverTargets()).device
-    let headers = try d.profileHeaders().filter { $0.sector != 0 }
     guard let arg = args.positional.first else {
-        let active = try d.activeProfile()
-        print("Active profile sector: 0x\(hex16(active))"
-            + (active == 0 ? "  (none selected)" : ""))
+        print("Active profile sector: 0x\(hex16(try d.activeProfile()))")
         return
     }
+    if arg == "factory" {
+        let sector = try d.useFactoryProfile(dryRun: args.has("dry-run"))
+        print(args.has("dry-run")
+              ? "Would back up and clear the user directory, then select factory profile 0x\(hex16(sector)). Nothing was changed."
+              : "Factory profile 0x\(hex16(sector)) is active. User profile data is still in memory.")
+        return
+    }
+    let factories = try d.factoryProfileHeaders()
+    // Read ROM directly so a bad user directory can't block factory selection.
+    let explicit = arg.lowercased().hasPrefix("0x") ? UInt16(arg.dropFirst(2), radix: 16) : nil
+    if let explicit, factories.contains(where: { $0.sector == explicit }) {
+        try d.activateProfile(explicit)
+        print("Activated factory profile sector 0x\(hex16(explicit)).")
+        return
+    }
+    let headers = try d.profileHeaders()
     let sector: UInt16
     if let n = Int(arg), n >= 1 && n <= headers.count {
         sector = headers[n - 1].sector
     } else if let hexSector = UInt16(arg.replacingOccurrences(of: "0x", with: ""), radix: 16),
-              headers.contains(where: { $0.sector == hexSector }) {
+              (headers + factories).contains(where: { $0.sector == hexSector }) {
         sector = hexSector
     } else {
-        throw LogiError.usage("usage: logi profile use <1-\(headers.count)>")
+        throw LogiError.usage("usage: logi profile use <number|0xsector|factory>")
     }
-    try d.setActiveProfile(sector)
+    try d.activateProfile(sector)
     print("Activated profile sector 0x\(hex16(sector)).")
+}
+
+func cmdProfile() throws {
+    guard let sub = args.positional.first else { try cmdProfiles(); return }
+    args.positional.removeFirst()
+    if sub == "use" { try cmdProfileUse(); return }
+    if sub == "factory" {
+        args.positional = ["factory"]
+        try cmdProfileUse()
+        return
+    }
+    let d = selectTarget(discoverTargets()).device
+    switch sub {
+    case "create":
+        let source = try resolveProfileSector(d)
+        let result = try d.editProfile(source, clone: true, dryRun: args.has("dry-run")) { _, _ in }
+        printProfileWrite(result, action: "copy of profile 0x\(hex16(source))")
+    case "backup":
+        let url = args.positional.first.map { URL(fileURLWithPath: $0) }
+        print("Saved onboard profile backup to \(try d.backupProfiles(to: url).path)")
+    case "restore":
+        guard let path = args.positional.first else { throw LogiError.usage("usage: logi profile restore <backup-file> [--dry-run]") }
+        let result = try d.restoreProfiles(from: URL(fileURLWithPath: path), dryRun: args.has("dry-run"))
+        print(result.dryRun
+              ? "Would restore saved profiles and select 0x\(hex16(result.sector)). Nothing was changed."
+              : "Restored saved profiles. Active sector is 0x\(hex16(result.sector)).")
+    default: throw LogiError.usage("usage: logi profile <use|factory|create|backup|restore>")
+    }
 }
 
 func cmdOnboard() throws {
@@ -712,7 +775,10 @@ COMMANDS
   dpi set <value>         Set DPI for this session
   dpi set <value> --persist [--slot N]
                           Write it into the onboard profile so it survives a
-                          power cycle (stage 0-4; default: the active stage)
+                          power cycle (stage 0-4, using the stored default
+                          stage if --slot is omitted).
+                          Factory profiles are copied to an unused user slot.
+                          Saves a backup first and checks the bytes afterward.
 
   rate                    Show current and supported report rates
   rate set <hz>           Set the report rate, falling back to the onboard
@@ -731,7 +797,14 @@ COMMANDS
   buttons reset           (the four above need HID++ feature 0x1B04)
 
   profiles                Dump onboard profiles: DPI stages, rate, bindings
-  profile use <n>         Activate a profile (re-pairing can leave none active)
+  profile use <n|0xsector|factory>
+                          Activate a user or factory profile
+  profile factory         Back up and clear the user directory, then select ROM
+  profile create          Copy the selected profile to a free slot and activate it
+  profile backup [file]    Back up all user sectors and factory profiles
+  profile restore <file>  Restore this mouse's saved settings
+  --dry-run               Show what an onboard edit or profile create, restore,
+                          or factory command would do without changing the mouse
   onboard [onboard|host]  Show or set the onboard-profile mode
   dump-sector <hex> [--size N]
                           Hex-dump a raw onboard memory sector
@@ -754,6 +827,12 @@ NOTES
 """
 
 do {
+    if args.has("dry-run") {
+        let supported = args.command == "dpi" || args.command == "rate" || args.command == "report-rate"
+            || ((args.command == "buttons" || args.command == "button") && args.positional.first == "set")
+            || (args.command == "profile" && ["create", "restore", "factory"].contains(args.positional.first ?? ""))
+        guard supported else { throw LogiError.usage("--dry-run is supported for DPI/rate/onboard-button edits and profile create/restore/factory") }
+    }
     switch args.command {
     case "devices", "list", "ls": cmdDevices()
     case "info", "status": try cmdInfo()
@@ -763,13 +842,7 @@ do {
     case "battery": try cmdBattery()
     case "buttons", "button": try cmdButtons()
     case "profiles": try cmdProfiles()
-    case "profile":
-        if args.positional.first == "use" {
-            args.positional.removeFirst()
-            try cmdProfileUse()
-        } else {
-            try cmdProfiles()
-        }
+    case "profile": try cmdProfile()
     case "onboard": try cmdOnboard()
     case "dump-sector": try cmdDumpSector()
     case "pair": try cmdPair()
