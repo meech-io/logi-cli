@@ -5,7 +5,15 @@ import IOKit.hid
 /// A HID++ endpoint: the vendor-specific (usage page 0xFF00) collection that
 /// Logitech receivers and devices expose alongside their normal mouse/keyboard
 /// interfaces. Everything in this tool is spoken over that one interface.
-final class HIDPPInterface {
+protocol HIDPPTransport: AnyObject {
+    var productName: String { get }
+    var isReceiver: Bool { get }
+    func write(_ frame: [UInt8]) throws
+    func drain()
+    func awaitFrame(timeout: TimeInterval, match: ([UInt8]) -> Bool) -> [UInt8]?
+}
+
+final class HIDPPInterface: HIDPPTransport {
     let device: IOHIDDevice
     let vendorID: Int
     let productID: Int
@@ -148,6 +156,7 @@ final class HIDPPInterface {
 enum LogiError: Error, CustomStringConvertible {
     case io(String)
     case protocolError(String)
+    case featureError(code: UInt8, feature: UInt8, function: UInt8)
     case unsupported(String)
     case usage(String)
 
@@ -155,6 +164,9 @@ enum LogiError: Error, CustomStringConvertible {
         switch self {
         case .io(let m): return m
         case .protocolError(let m): return m
+        case .featureError(let code, let feature, let function):
+            return "device returned error: \(HIDPP.errorCodes20[code] ?? "code 0x\(hex(code))")"
+                + " (feature 0x\(hex(feature)), function \(function))"
         case .unsupported(let m): return m
         case .usage(let m): return m
         }
